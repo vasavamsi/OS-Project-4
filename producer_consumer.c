@@ -76,14 +76,25 @@ static int __init zombie_killer_init(void) {
     sema_init(&empty, BUFFER_SIZE);
     sema_init(&full, 0);
 
-    // Start producer thread
-    kthread_run(producer_function, NULL, "Producer-1");
+    // Start producer thread (only one)
+    struct task_struct *producer_thread = kthread_run(producer_function, NULL, "Producer-1");
+    if (!producer_thread) {
+        printk(KERN_ERR "Failed to create producer thread.\n");
+        return -1; // Return an error if thread creation fails
+    }
+    printk(KERN_INFO "Producer thread started.\n");
 
     // Start consumer threads
     for (i = 0; i < cons; i++) {
         int *id = kmalloc(sizeof(int), GFP_KERNEL);
         *id = i + 1;
-        kthread_run(consumer_function, id, "Consumer-%d", *id);
+        struct task_struct *consumer_thread = kthread_run(consumer_function, id, "Consumer-%d", *id);
+        if (!consumer_thread) {
+            printk(KERN_ERR "Failed to create consumer thread %d.\n", *id);
+            kfree(id); // Free the memory if thread creation fails
+            return -1; // Return an error
+        }
+        printk(KERN_INFO "Consumer thread %d started.\n", *id);
     }
 
     return 0;
@@ -99,4 +110,3 @@ module_exit(zombie_killer_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Vamsi Krishna Vasa"); // Replace with your name
 MODULE_DESCRIPTION("Zombie Killer: A module to identify and kill zombie processes.");
-
