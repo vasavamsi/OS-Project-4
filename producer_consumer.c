@@ -7,12 +7,9 @@
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
 
-#define BUFFER_SIZE 10 // Define a max size for the circular buffer
-#define EXIT_ZOMBIE 0x00000020 // Define exit state for zombies
-
 static int prod = 1; // Always set to 1
 static int cons = 0; // Set based on user input
-static int size = 0; // Size of the circular buffer
+static int size = 10; // Default size of the circular buffer
 static int uid = 0;  // UID of the test user
 
 module_param(prod, int, 0);
@@ -22,9 +19,11 @@ module_param(uid, int, 0);
 
 static struct semaphore empty;
 static struct semaphore full;
-static struct task_struct *zombie_buffer[BUFFER_SIZE]; // Circular buffer for zombies
+static struct task_struct **zombie_buffer; // Pointer for the circular buffer
 static int in = 0; // Index for producer
 static int out = 0; // Index for consumer
+
+#define EXIT_ZOMBIE 0x00000020 // Define exit state for zombies
 
 int producer_function(void *data) {
     char thread_name[16];
@@ -40,7 +39,7 @@ int producer_function(void *data) {
                 zombie_buffer[in] = p;
                 printk(KERN_INFO "[%s] has produced a zombie process with pid %d and parent pid %d\n",
                        thread_name, p->pid, p->real_parent->pid);
-                in = (in + 1) % BUFFER_SIZE; // Circular increment
+                in = (in + 1) % size; // Circular increment
                 up(&full);
             }
         }
@@ -63,7 +62,7 @@ int consumer_function(void *data) {
             printk(KERN_INFO "[%s] has consumed a zombie process with pid %d and parent pid %d\n",
                    thread_name, zombie->pid, zombie->real_parent->pid);
             kill_pid(zombie->real_parent->thread_pid, SIGKILL, 0);
-            out = (out + 1) % BUFFER_SIZE; // Circular increment
+            out = (out + 1) % size; // Circular increment
         }
         up(&empty);
     }
@@ -73,13 +72,25 @@ int consumer_function(void *data) {
 static int __init zombie_killer_init(void) {
     int i;
 
-    sema_init(&empty, BUFFER_SIZE);
+    if (size <= 0) {
+        printk(KERN_ERR "Invalid buffer size: %d. Must be greater than 0.\n", size);
+        return -EINVAL; // Return an error if size is invalid
+    }
+
+    zombie_buffer = kmalloc_array(size, sizeof(struct task_struct *), GFP_KERNEL);
+    if (!zombie_buffer) {
+        printk(KERN_ERR "Failed to allocate memory for zombie buffer.\n");
+        return -ENOMEM; // Return an error if memory allocation fails
+    }
+
+    sema_init(&empty, size);
     sema_init(&full, 0);
 
     // Start producer thread (only one)
     struct task_struct *producer_thread = kthread_run(producer_function, NULL, "Producer-1");
     if (!producer_thread) {
         printk(KERN_ERR "Failed to create producer thread.\n");
+        kfree(zombie_buffer); // Free the buffer memory if thread creation fails
         return -1; // Return an error if thread creation fails
     }
     printk(KERN_INFO "Producer thread started.\n");
@@ -92,6 +103,7 @@ static int __init zombie_killer_init(void) {
         if (!consumer_thread) {
             printk(KERN_ERR "Failed to create consumer thread %d.\n", *id);
             kfree(id); // Free the memory if thread creation fails
+            kfree(zombie_buffer); // Free the buffer memory
             return -1; // Return an error
         }
         printk(KERN_INFO "Consumer thread %d started.\n", *id);
@@ -101,6 +113,7 @@ static int __init zombie_killer_init(void) {
 }
 
 static void __exit zombie_killer_exit(void) {
+    kfree(zombie_buffer); // Free the allocated buffer
     printk(KERN_INFO "Zombie Killer module unloaded.\n");
 }
 
