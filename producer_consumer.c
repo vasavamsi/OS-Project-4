@@ -21,6 +21,8 @@ module_param(uid, int, 0);
 static struct semaphore empty;
 static struct semaphore full;
 static struct task_struct **zombie_buffer; // Pointer for the circular buffer
+static struct task_struct **consumer_threads; // Array to store consumer thread pointers
+static int total_consumers = 0; // Track number of consumer threads
 static int in = 0; // Index for producer
 static int out = 0; // Index for consumer
 
@@ -58,6 +60,7 @@ int consumer_function(void *data) {
     int id = *(int *)data;
     char thread_name[16];
     snprintf(thread_name, sizeof(thread_name), "Consumer-%d", id);
+    kfree(data); // Free the allocated id memory
 
     while (!kthread_should_stop()) {
         down_interruptible(&full);
@@ -80,24 +83,38 @@ static int __init zombie_killer_init(void) {
 
     if (size <= 0) {
         printk(KERN_ERR "Invalid buffer size: %d. Must be greater than 0.\n", size);
-        return -EINVAL; // Return an error if size is invalid
+        return -EINVAL;
+    }
+
+    // Allocate memory for consumer threads array
+    consumer_threads = kmalloc_array(cons, sizeof(struct task_struct *), GFP_KERNEL);
+    if (!consumer_threads) {
+        printk(KERN_ERR "Failed to allocate memory for consumer threads array.\n");
+        return -ENOMEM;
     }
 
     zombie_buffer = kmalloc_array(size, sizeof(struct task_struct *), GFP_KERNEL);
     if (!zombie_buffer) {
         printk(KERN_ERR "Failed to allocate memory for zombie buffer.\n");
-        return -ENOMEM; // Return an error if memory allocation fails
+        kfree(consumer_threads);
+        return -ENOMEM;
+    }
+
+    // Initialize the zombie buffer
+    for (i = 0; i < size; i++) {
+        zombie_buffer[i] = NULL;
     }
 
     sema_init(&empty, size);
     sema_init(&full, 0);
 
-    // Start producer thread (only one)
+    // Start producer thread
     producer_thread = kthread_run(producer_function, NULL, "Producer-1");
     if (!producer_thread) {
         printk(KERN_ERR "Failed to create producer thread.\n");
-        kfree(zombie_buffer); // Free the buffer memory if thread creation fails
-        return -1; // Return an error if thread creation fails
+        kfree(zombie_buffer);
+        kfree(consumer_threads);
+        return -1;
     }
     printk(KERN_INFO "Producer thread started.\n");
 
@@ -105,13 +122,19 @@ static int __init zombie_killer_init(void) {
     for (i = 0; i < cons; i++) {
         int *id = kmalloc(sizeof(int), GFP_KERNEL);
         *id = i + 1;
-        struct task_struct *consumer_thread = kthread_run(consumer_function, id, "Consumer-%d", *id);
-        if (!consumer_thread) {
+        consumer_threads[i] = kthread_run(consumer_function, id, "Consumer-%d", *id);
+        if (!consumer_threads[i]) {
             printk(KERN_ERR "Failed to create consumer thread %d.\n", *id);
-            kfree(id); // Free the memory if thread creation fails
-            kfree(zombie_buffer); // Free the buffer memory
-            return -1; // Return an error
+            kfree(id);
+            // Clean up previously created threads
+            while (--i >= 0) {
+                kthread_stop(consumer_threads[i]);
+            }
+            kfree(consumer_threads);
+            kfree(zombie_buffer);
+            return -1;
         }
+        total_consumers++;
         printk(KERN_INFO "Consumer thread %d started.\n", *id);
     }
 
@@ -119,7 +142,8 @@ static int __init zombie_killer_init(void) {
 }
 
 static void __exit zombie_killer_exit(void) {
-    exit_flag = 1; // Signal the producer thread to exit
+    int i;
+    exit_flag = 1; // Signal threads to exit
 
     // Stop the producer thread
     if (producer_thread) {
@@ -127,7 +151,17 @@ static void __exit zombie_killer_exit(void) {
         printk(KERN_INFO "Producer thread stopped.\n");
     }
 
-    kfree(zombie_buffer); // Free the allocated buffer
+    // Stop all consumer threads
+    for (i = 0; i < total_consumers; i++) {
+        if (consumer_threads[i]) {
+            kthread_stop(consumer_threads[i]);
+            printk(KERN_INFO "Consumer thread %d stopped.\n", i + 1);
+        }
+    }
+
+    // Free allocated memory
+    kfree(consumer_threads);
+    kfree(zombie_buffer);
     printk(KERN_INFO "Zombie Killer module unloaded.\n");
 }
 
@@ -135,5 +169,5 @@ module_init(zombie_killer_init);
 module_exit(zombie_killer_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Vamsi Krishna Vasa"); // Replace with your name
+MODULE_AUTHOR("Vamsi Krishna Vasa");
 MODULE_DESCRIPTION("Zombie Killer: A module to identify and kill zombie processes.");
