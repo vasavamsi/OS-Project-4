@@ -6,12 +6,14 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
+#include <linux/atomic.h>
 
-static int prod = 1; // Always set to 1
-static int cons = 0; // Set based on user input
-static int size = 10; // Default size of the circular buffer
-static int uid = 0;  // UID of the test user
-static int exit_flag = 0; // Flag to signal exit
+static int prod = 1;
+static int cons = 0;
+static int size = 10;
+static int uid = 0;
+static int exit_flag = 0;
+static atomic_t active_consumers;
 
 module_param(prod, int, 0);
 module_param(cons, int, 0);
@@ -20,32 +22,29 @@ module_param(uid, int, 0);
 
 static struct semaphore empty;
 static struct semaphore full;
-static struct task_struct **zombie_buffer; // Pointer for the circular buffer
-static struct task_struct **consumer_threads; // Array to store consumer thread pointers
-static int total_consumers = 0; // Track number of consumer threads
-static int in = 0; // Index for producer
-static int out = 0; // Index for consumer
+static struct task_struct **zombie_buffer;
+static struct task_struct **consumer_threads;
+static int in = 0;
+static int out = 0;
+static struct task_struct *producer_thread;
+static DEFINE_MUTEX(buffer_mutex);
 
-static struct task_struct *producer_thread; // Pointer for the producer thread
-
-#define EXIT_ZOMBIE 0x00000020 // Define exit state for zombies
+#define EXIT_ZOMBIE 0x00000020
 
 int producer_function(void *data) {
-    char thread_name[16];
-    snprintf(thread_name, sizeof(thread_name), "Producer-%d", 1);
-
-    while (!kthread_should_stop()) {
-        if (exit_flag) // Check if we should exit
-            break;
-
-        struct task_struct *p;
+    struct task_struct *p;
+    
+    while (!kthread_should_stop() && !exit_flag) {
         for_each_process(p) {
             if (p->cred->uid.val == uid && (p->exit_state & EXIT_ZOMBIE)) {
-                down_interruptible(&empty);
+                if (down_interruptible(&empty))
+                    continue;
+                    
+                mutex_lock(&buffer_mutex);
                 zombie_buffer[in] = p;
-                printk(KERN_INFO "[%s] has produced a zombie process with pid %d and parent pid %d\n",
-                       thread_name, p->pid, p->real_parent->pid);
                 in = (in + 1) % size;
+                mutex_unlock(&buffer_mutex);
+                
                 up(&full);
             }
         }
@@ -56,29 +55,34 @@ int producer_function(void *data) {
 
 int consumer_function(void *data) {
     int id = *(int *)data;
-    char thread_name[16];
-    snprintf(thread_name, sizeof(thread_name), "Consumer-%d", id);
+    struct task_struct *zombie;
     kfree(data);
 
+    atomic_inc(&active_consumers);
+
     while (!kthread_should_stop() && !exit_flag) {
-        if (down_interruptible(&full))
+        if (down_interruptible(&full)) {
             break;
+        }
 
         if (kthread_should_stop() || exit_flag) {
             up(&full);
             break;
         }
 
-        struct task_struct *zombie = zombie_buffer[out];
+        mutex_lock(&buffer_mutex);
+        zombie = zombie_buffer[out];
         if (zombie) {
-            printk(KERN_INFO "[%s] has consumed a zombie process with pid %d and parent pid %d\n",
-                   thread_name, zombie->pid, zombie->real_parent->pid);
             kill_pid(zombie->real_parent->thread_pid, SIGKILL, 0);
             out = (out + 1) % size;
         }
+        mutex_unlock(&buffer_mutex);
+        
         up(&empty);
-        msleep(100);
+        msleep(50);
     }
+
+    atomic_dec(&active_consumers);
     return 0;
 }
 
@@ -86,56 +90,59 @@ static int __init zombie_killer_init(void) {
     int i;
 
     if (size <= 0) {
-        printk(KERN_ERR "Invalid buffer size: %d. Must be greater than 0.\n", size);
+        printk(KERN_ERR "Invalid buffer size\n");
         return -EINVAL;
     }
 
-    consumer_threads = kmalloc_array(cons, sizeof(struct task_struct *), GFP_KERNEL);
-    if (!consumer_threads) {
-        printk(KERN_ERR "Failed to allocate memory for consumer threads array.\n");
-        return -ENOMEM;
-    }
+    atomic_set(&active_consumers, 0);
 
     zombie_buffer = kmalloc_array(size, sizeof(struct task_struct *), GFP_KERNEL);
-    if (!zombie_buffer) {
-        printk(KERN_ERR "Failed to allocate memory for zombie buffer.\n");
-        kfree(consumer_threads);
+    if (!zombie_buffer)
+        return -ENOMEM;
+
+    consumer_threads = kmalloc_array(cons, sizeof(struct task_struct *), GFP_KERNEL);
+    if (!consumer_threads) {
+        kfree(zombie_buffer);
         return -ENOMEM;
     }
 
-    for (i = 0; i < size; i++) {
+    for (i = 0; i < size; i++)
         zombie_buffer[i] = NULL;
-    }
 
     sema_init(&empty, size);
     sema_init(&full, 0);
 
-    producer_thread = kthread_run(producer_function, NULL, "Producer-1");
-    if (!producer_thread) {
-        printk(KERN_ERR "Failed to create producer thread.\n");
+    producer_thread = kthread_run(producer_function, NULL, "producer");
+    if (IS_ERR(producer_thread)) {
         kfree(zombie_buffer);
         kfree(consumer_threads);
-        return -1;
+        return PTR_ERR(producer_thread);
     }
-    printk(KERN_INFO "Producer thread started.\n");
 
     for (i = 0; i < cons; i++) {
         int *id = kmalloc(sizeof(int), GFP_KERNEL);
-        *id = i + 1;
-        consumer_threads[i] = kthread_run(consumer_function, id, "Consumer-%d", *id);
-        if (!consumer_threads[i]) {
-            printk(KERN_ERR "Failed to create consumer thread %d.\n", *id);
-            kfree(id);
-            while (--i >= 0) {
-                kthread_stop(consumer_threads[i]);
-            }
+        if (!id) {
+            exit_flag = 1;
             kthread_stop(producer_thread);
-            kfree(consumer_threads);
+            while (--i >= 0)
+                kthread_stop(consumer_threads[i]);
             kfree(zombie_buffer);
-            return -1;
+            kfree(consumer_threads);
+            return -ENOMEM;
         }
-        total_consumers++;
-        printk(KERN_INFO "Consumer thread %d started.\n", *id);
+        *id = i + 1;
+        
+        consumer_threads[i] = kthread_run(consumer_function, id, "consumer-%d", i);
+        if (IS_ERR(consumer_threads[i])) {
+            kfree(id);
+            exit_flag = 1;
+            kthread_stop(producer_thread);
+            while (--i >= 0)
+                kthread_stop(consumer_threads[i]);
+            kfree(zombie_buffer);
+            kfree(consumer_threads);
+            return PTR_ERR(consumer_threads[i]);
+        }
     }
 
     return 0;
@@ -144,32 +151,33 @@ static int __init zombie_killer_init(void) {
 static void __exit zombie_killer_exit(void) {
     int i;
     exit_flag = 1;
-    msleep(200); // Wait for threads to see exit flag
+    msleep(200);
 
     if (producer_thread) {
         kthread_stop(producer_thread);
         msleep(100);
     }
 
-    // Wake up any waiting consumers
     for (i = 0; i < cons; i++) {
         up(&full);
         up(&empty);
     }
 
-    msleep(100);
-
-    for (i = 0; i < total_consumers; i++) {
+    for (i = 0; i < cons; i++) {
         if (consumer_threads[i]) {
             kthread_stop(consumer_threads[i]);
-            msleep(50);
         }
     }
 
-    msleep(100);
-    kfree(consumer_threads);
+    // Wait for all consumers to finish
+    while (atomic_read(&active_consumers) > 0) {
+        msleep(50);
+    }
+
+    mutex_lock(&buffer_mutex);
     kfree(zombie_buffer);
-    printk(KERN_INFO "Zombie Killer module unloaded.\n");
+    kfree(consumer_threads);
+    mutex_unlock(&buffer_mutex);
 }
 
 module_init(zombie_killer_init);
