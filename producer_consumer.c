@@ -11,6 +11,7 @@ static int prod = 1; // Always set to 1
 static int cons = 0; // Set based on user input
 static int size = 10; // Default size of the circular buffer
 static int uid = 0;  // UID of the test user
+static int exit_flag = 0; // Flag to signal exit
 
 module_param(prod, int, 0);
 module_param(cons, int, 0);
@@ -32,6 +33,9 @@ int producer_function(void *data) {
     snprintf(thread_name, sizeof(thread_name), "Producer-%d", 1);
 
     while (!kthread_should_stop()) {
+        if (exit_flag) // Check if we should exit
+            break;
+
         struct task_struct *p;
         for_each_process(p) {
             // Check for zombie process and UID match
@@ -115,6 +119,8 @@ static int __init zombie_killer_init(void) {
 }
 
 static void __exit zombie_killer_exit(void) {
+    exit_flag = 1; // Signal the producer thread to exit
+
     // Stop the producer thread
     if (producer_thread) {
         kthread_stop(producer_thread);
