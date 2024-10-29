@@ -6,6 +6,7 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
+#include <linux/completion.h>
 
 static int prod = 1; // Always set to 1
 static int cons = 0; // Set based on user input
@@ -22,6 +23,8 @@ static struct semaphore empty;
 static struct semaphore full;
 static struct task_struct **zombie_buffer; // Pointer for the circular buffer
 static struct task_struct **consumer_threads; // Array to store consumer thread pointers
+static struct completion *consumer_completion; // Array of completion structures
+static int *consumer_stopped; // Array to track stopped status
 static int total_consumers = 0; // Track number of consumer threads
 static int in = 0; // Index for producer
 static int out = 0; // Index for consumer
@@ -29,6 +32,17 @@ static int out = 0; // Index for consumer
 static struct task_struct *producer_thread; // Pointer for the producer thread
 
 #define EXIT_ZOMBIE 0x00000020 // Define exit state for zombies
+
+static void cleanup_module_resources(void) {
+    if (consumer_stopped)
+        kfree(consumer_stopped);
+    if (consumer_completion)
+        kfree(consumer_completion);
+    if (consumer_threads)
+        kfree(consumer_threads);
+    if (zombie_buffer)
+        kfree(zombie_buffer);
+}
 
 int producer_function(void *data) {
     char thread_name[16];
@@ -60,21 +74,29 @@ int consumer_function(void *data) {
     int id = *(int *)data;
     char thread_name[16];
     snprintf(thread_name, sizeof(thread_name), "Consumer-%d", id);
-    kfree(data); // Free the allocated id memory
+    kfree(data);
 
     while (!kthread_should_stop()) {
-        down_interruptible(&full);
-        // Consume the zombie from the buffer
+        if (down_interruptible(&full))
+            break;
+            
+        if (kthread_should_stop()) {
+            up(&full);
+            break;
+        }
+        
         struct task_struct *zombie = zombie_buffer[out];
         if (zombie) {
-            // Kill the parent of the zombie
             printk(KERN_INFO "[%s] has consumed a zombie process with pid %d and parent pid %d\n",
                    thread_name, zombie->pid, zombie->real_parent->pid);
             kill_pid(zombie->real_parent->thread_pid, SIGKILL, 0);
-            out = (out + 1) % size; // Circular increment
+            out = (out + 1) % size;
         }
         up(&empty);
     }
+    
+    consumer_stopped[id - 1] = 1;
+    complete(&consumer_completion[id - 1]);
     return 0;
 }
 
@@ -93,14 +115,33 @@ static int __init zombie_killer_init(void) {
         return -ENOMEM;
     }
 
-    zombie_buffer = kmalloc_array(size, sizeof(struct task_struct *), GFP_KERNEL);
-    if (!zombie_buffer) {
-        printk(KERN_ERR "Failed to allocate memory for zombie buffer.\n");
+    // Allocate and initialize completion structures
+    consumer_completion = kmalloc_array(cons, sizeof(struct completion), GFP_KERNEL);
+    if (!consumer_completion) {
         kfree(consumer_threads);
         return -ENOMEM;
     }
 
-    // Initialize the zombie buffer
+    consumer_stopped = kmalloc_array(cons, sizeof(int), GFP_KERNEL);
+    if (!consumer_stopped) {
+        kfree(consumer_completion);
+        kfree(consumer_threads);
+        return -ENOMEM;
+    }
+
+    zombie_buffer = kmalloc_array(size, sizeof(struct task_struct *), GFP_KERNEL);
+    if (!zombie_buffer) {
+        printk(KERN_ERR "Failed to allocate memory for zombie buffer.\n");
+        cleanup_module_resources();
+        return -ENOMEM;
+    }
+
+    // Initialize arrays
+    for (i = 0; i < cons; i++) {
+        init_completion(&consumer_completion[i]);
+        consumer_stopped[i] = 0;
+    }
+
     for (i = 0; i < size; i++) {
         zombie_buffer[i] = NULL;
     }
@@ -112,8 +153,7 @@ static int __init zombie_killer_init(void) {
     producer_thread = kthread_run(producer_function, NULL, "Producer-1");
     if (!producer_thread) {
         printk(KERN_ERR "Failed to create producer thread.\n");
-        kfree(zombie_buffer);
-        kfree(consumer_threads);
+        cleanup_module_resources();
         return -1;
     }
     printk(KERN_INFO "Producer thread started.\n");
@@ -129,9 +169,9 @@ static int __init zombie_killer_init(void) {
             // Clean up previously created threads
             while (--i >= 0) {
                 kthread_stop(consumer_threads[i]);
+                wait_for_completion(&consumer_completion[i]);
             }
-            kfree(consumer_threads);
-            kfree(zombie_buffer);
+            cleanup_module_resources();
             return -1;
         }
         total_consumers++;
@@ -143,7 +183,7 @@ static int __init zombie_killer_init(void) {
 
 static void __exit zombie_killer_exit(void) {
     int i;
-    exit_flag = 1; // Signal threads to exit
+    exit_flag = 1;
 
     // Stop the producer thread
     if (producer_thread) {
@@ -151,17 +191,28 @@ static void __exit zombie_killer_exit(void) {
         printk(KERN_INFO "Producer thread stopped.\n");
     }
 
+    // Signal all semaphores to wake up potentially waiting consumers
+    for (i = 0; i < cons; i++) {
+        up(&full);
+    }
+
     // Stop all consumer threads
     for (i = 0; i < total_consumers; i++) {
         if (consumer_threads[i]) {
             kthread_stop(consumer_threads[i]);
-            printk(KERN_INFO "Consumer thread %d stopped.\n", i + 1);
+            // Wait for completion with timeout
+            if (!wait_for_completion_timeout(&consumer_completion[i], 
+                                           msecs_to_jiffies(1000))) {
+                printk(KERN_WARNING "Consumer thread %d might not have stopped properly.\n", i + 1);
+            } else {
+                printk(KERN_INFO "Consumer thread %d stopped successfully.\n", i + 1);
+            }
         }
     }
 
-    // Free allocated memory
-    kfree(consumer_threads);
-    kfree(zombie_buffer);
+    // Free all allocated resources
+    cleanup_module_resources();
+    
     printk(KERN_INFO "Zombie Killer module unloaded.\n");
 }
 
