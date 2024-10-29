@@ -23,6 +23,8 @@ static struct task_struct **zombie_buffer; // Pointer for the circular buffer
 static int in = 0; // Index for producer
 static int out = 0; // Index for consumer
 
+static struct task_struct *producer_thread; // Pointer for the producer thread
+
 #define EXIT_ZOMBIE 0x00000020 // Define exit state for zombies
 
 int producer_function(void *data) {
@@ -87,7 +89,7 @@ static int __init zombie_killer_init(void) {
     sema_init(&full, 0);
 
     // Start producer thread (only one)
-    struct task_struct *producer_thread = kthread_run(producer_function, NULL, "Producer-1");
+    producer_thread = kthread_run(producer_function, NULL, "Producer-1");
     if (!producer_thread) {
         printk(KERN_ERR "Failed to create producer thread.\n");
         kfree(zombie_buffer); // Free the buffer memory if thread creation fails
@@ -113,6 +115,12 @@ static int __init zombie_killer_init(void) {
 }
 
 static void __exit zombie_killer_exit(void) {
+    // Stop the producer thread
+    if (producer_thread) {
+        kthread_stop(producer_thread);
+        printk(KERN_INFO "Producer thread stopped.\n");
+    }
+
     kfree(zombie_buffer); // Free the allocated buffer
     printk(KERN_INFO "Zombie Killer module unloaded.\n");
 }
